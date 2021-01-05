@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from urllib3.exceptions import InsecureRequestWarning
 
 # debug模式
-debug = False
+debug = True
 if debug:
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -64,27 +64,25 @@ def getCpdailyApis(user):
             joinType = data['joinType']
             idsUrl = data['idsUrl']
             ampUrl = data['ampUrl']
-            ampUrl2 = data['ampUrl2']
             if 'campusphere' in ampUrl or 'cpdaily' in ampUrl:
                 parse = urlparse(ampUrl)
                 host = parse.netloc
+                res = requests.get(parse.scheme + '://' + host)
+                parse = urlparse(res.url)
                 apis[
                     'login-url'] = idsUrl + '/login?service=' + parse.scheme + r"%3A%2F%2F" + host + r'%2Fportal%2Flogin'
                 apis['host'] = host
+
+            ampUrl2 = data['ampUrl2']
             if 'campusphere' in ampUrl2 or 'cpdaily' in ampUrl2:
                 parse = urlparse(ampUrl2)
                 host = parse.netloc
+                res = requests.get(parse.scheme + '://' + host)
+                parse = urlparse(res.url)
                 apis[
                     'login-url'] = idsUrl + '/login?service=' + parse.scheme + r"%3A%2F%2F" + host + r'%2Fportal%2Flogin'
                 apis['host'] = host
-            if joinType == 'NOTCLOUD':
-                res = requests.get(url=apis['login-url'], verify=not debug)
-                if urlparse(apis['login-url']).netloc != urlparse(res.url):
-                    apis['login-url'] = res.url
             break
-    if user['school'] == '云南财经大学':
-        apis[
-            'login-url'] = 'http://idas.ynufe.edu.cn/authserver/login?service=https%3A%2F%2Fynufe.cpdaily.com%2Fportal%2Flogin'
     if flag:
         log(user['school'] + ' 未找到该院校信息，请检查是否是学校全称错误')
         exit(-1)
@@ -106,10 +104,16 @@ def getSession(user, apis):
 
     cookies = {}
     # 借助上一个项目开放出来的登陆API，模拟登陆
-    res = requests.post(url=config['login']['api'], data=params, verify=not debug)
+    res = ''
+    try:
+        res = requests.post(url=config['login']['api'], data=params, verify=not debug)
+    except Exception as e:
+        res = requests.post(url='http://127.0.0.1:8080/wisedu-unified-login-api-v1.0/api/login', data=params, verify=not debug)
+    
     # cookieStr可以使用手动抓包获取到的cookie，有效期暂时未知，请自己测试
+    # cookieStr = str(res.json()['cookies'])
     cookieStr = str(res.json()['cookies'])
-    log(cookieStr)
+    # log(cookieStr) 调试时再输出
     if cookieStr == 'None':
         log(res.json())
         exit(-1)
@@ -124,8 +128,8 @@ def getSession(user, apis):
     return session
 
 
-# 获取最新未签到任务
-def getUnSignedTasks(session, apis):
+# 获取最新未签到任务并全部签到
+def getUnSignedTasksAndSign(session, apis, user):
     headers = {
         'Accept': 'application/json, text/plain, */*',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36',
@@ -136,21 +140,28 @@ def getUnSignedTasks(session, apis):
     }
     # 第一次请求每日签到任务接口，主要是为了获取MOD_AUTH_CAS
     res = session.post(
-        url='https://{host}/wec-counselor-sign-apps/stu/sign/getStuSignInfosInOneDay'.format(host=apis['host']),
+        url='https://{host}/wec-counselor-sign-apps/stu/sign/queryDailySginTasks'.format(host=apis['host']),
         headers=headers, data=json.dumps({}), verify=not debug)
     # 第二次请求每日签到任务接口，拿到具体的签到任务
     res = session.post(
-        url='https://{host}/wec-counselor-sign-apps/stu/sign/getStuSignInfosInOneDay'.format(host=apis['host']),
+        url='https://{host}/wec-counselor-sign-apps/stu/sign/queryDailySginTasks'.format(host=apis['host']),
         headers=headers, data=json.dumps({}), verify=not debug)
     if len(res.json()['datas']['unSignedTasks']) < 1:
         log('当前没有未签到任务')
         exit(-1)
     # log(res.json())
-    latestTask = res.json()['datas']['unSignedTasks'][0]
-    return {
-        'signInstanceWid': latestTask['signInstanceWid'],
-        'signWid': latestTask['signWid']
-    }
+    for i in range(0, len(res.json()['datas']['unSignedTasks'])):
+       #if '出校' in res.json()['datas']['unSignedTasks'][i]['taskName'] == False:
+        # if '入校' in res.json()['datas']['unSignedTasks'][i]['taskName'] == False:
+            latestTask = res.json()['datas']['unSignedTasks'][i]
+            params = {
+              'signInstanceWid': latestTask['signInstanceWid'],
+              'signWid': latestTask['signWid']
+            }
+            task = getDetailTask(session, params, apis)
+            form = fillForm(task, session, user, apis)
+            
+            submitForm(session, user, form, apis)
 
 
 # 获取签到任务详情
@@ -164,7 +175,7 @@ def getDetailTask(session, params, apis):
         'Content-Type': 'application/json;charset=UTF-8'
     }
     res = session.post(
-        url='https://{host}/wec-counselor-sign-apps/stu/sign/detailSignInstance'.format(host=apis['host']),
+        url='https://{host}/wec-counselor-sign-apps/stu/sign/detailSignTaskInst'.format(host=apis['host']),
         headers=headers, data=json.dumps(params), verify=not debug)
     data = res.json()['datas']
     return data
@@ -186,7 +197,7 @@ def fillForm(task, session, user, apis):
         for i in range(0, len(extraFields)):
             default = defaults[i]['default']
             extraField = extraFields[i]
-            if default['title'] != extraField['title']:
+            if config['cpdaily']['check'] and default['title'] != extraField['title']:
                 log('第%d个默认配置项错误，请检查' % (i + 1))
                 exit(-1)
             extraFieldItems = extraField['extraFieldItems']
@@ -194,6 +205,10 @@ def fillForm(task, session, user, apis):
                 if extraFieldItem['content'] == default['value']:
                     extraFieldItemValue = {'extraFieldItemValue': default['value'],
                                            'extraFieldItemWid': extraFieldItem['wid']}
+                    # 其他，额外文本
+                    if extraFieldItem['isOtherItems'] == 1:
+                        extraFieldItemValue = {'extraFieldItemValue': default['other'],
+                                               'extraFieldItemWid': extraFieldItem['wid']}
                     extraFieldItemValues.append(extraFieldItemValue)
         # log(extraFieldItemValues)
         # 处理带附加选项的签到
@@ -256,7 +271,7 @@ def submitForm(session, user, form, apis):
         "lon": user['lon'],
         "model": "OPPO R11 Plus",
         "appVersion": "8.1.14",
-        "systemVersion": "4.4.4",
+        "systemVersion": "8.0",
         "userId": user['username'],
         "systemName": "android",
         "lat": user['lat'],
@@ -274,7 +289,7 @@ def submitForm(session, user, form, apis):
         # 'Host': 'swu.cpdaily.com',
         'Connection': 'Keep-Alive'
     }
-    res = session.post(url='https://{host}/wec-counselor-sign-apps/stu/sign/submitSign'.format(host=apis['host']),
+    res = session.post(url='https://{host}/wec-counselor-sign-apps/stu/sign/completeSignIn'.format(host=apis['host']),
                        headers=headers, data=json.dumps(form), verify=not debug)
     message = res.json()['message']
     if message == 'SUCCESS':
@@ -289,16 +304,25 @@ def submitForm(session, user, form, apis):
 # 发送邮件通知
 def sendMessage(msg, email):
     send = email
-    if send != '':
-        log('正在发送邮件通知。。。')
-        res = requests.post(url='http://www.zimo.wiki:8080/mail-sender/sendMail',
-                            data={'title': '今日校园自动签到结果通知', 'content': msg, 'to': send}, verify=not debug)
-        code = res.json()['code']
-        if code == 0:
-            log('发送邮件通知成功。。。')
-        else:
-            log('发送邮件通知失败。。。')
-            log(res.json())
+    if msg.count("未开始")>0:
+        return ''
+    try:
+        if send != '':
+                log('正在发送邮件通知。。。')
+                log(getTimeStr())
+ #               sendMessageWeChat(msg + getTimeStr(), '今日校园自动签到结果通知')
+    
+                res = requests.post(url='http://www.zimo.wiki:8080/mail-sender/sendMail',
+                            data={'title': '今日校园自动签到结果通知' + getTimeStr(), 'content': msg, 'to': send}, verify=not debug)
+                code = res.json()['code']
+                if code == 0:
+                    log('发送邮件通知成功。。。')
+                else:
+                    log('发送邮件通知失败。。。')
+                log(res.json())
+    except Exception as e:
+        log("send failed")
+
 
 
 # 主函数
@@ -306,20 +330,17 @@ def main():
     for user in config['users']:
         apis = getCpdailyApis(user)
         session = getSession(user, apis)
-        params = getUnSignedTasks(session, apis)
-        task = getDetailTask(session, params, apis)
-        form = fillForm(task, session, user, apis)
-        # form = getDetailTask(session, user, params, apis)
-        submitForm(session, user, form, apis)
+        getUnSignedTasksAndSign(session, apis, user)
 
 
 # 提供给腾讯云函数调用的启动函数
 def main_handler(event, context):
     try:
         main()
+    except Exception as e:
+        raise e
+    else:
         return 'success'
-    except:
-        return 'fail'
 
 
 if __name__ == '__main__':
